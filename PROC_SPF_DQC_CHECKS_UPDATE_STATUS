@@ -1,0 +1,1448 @@
+USE [SPOTFIRE_DQC]
+GO
+/****** Object:  StoredProcedure [dbo].[PROC_SPF_DQC_CHECKS_UPDATE_STATUS]    Script Date: 4/7/2023 9:41:14 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+-- =============================================
+-- Author:		Jerry Alex
+-- Create date: Saturday, 08/14/2022
+-- Description:	This procudure is designed as a gateway to insert 
+--				the DQC records that are reviewed or touched by any user
+--				into the corresponding status tables. 
+--
+-- Purpose: Monitor the DM DQC Spotfire template and capture the comments from users
+--			and update the corresponding status table.
+--
+-- THIS PROCEDURE IS PHASE II. THE FIRST HALF OF THE INSERT PROCESS
+-- IS ACCOMPLISHED VIA PROCEDURE: [dbo].[PROC_SPF_DQC_CHECKS]
+--
+-- Process:
+--   *** This procedure is executed from [PROC_SPF_DQC_CHECKS] where the values are passed in from that proc
+--
+--   This procedure accomplishes two things: 
+--		** First: An INSERT event is triggered when a new comment needs to be added for an 'UNREVIEWED' record
+--		** Second: An UPDATE even is triggered if an existing comment within a STATUS table need to be update
+--
+--	This procedure executes the SECOND STEP of the overall process
+-- =============================================
+
+/* ************************************************************************ */
+/* -- IMPORTANT: THIS PROC IS NOT INTENDED TO BE EXECUTED AS A STANDALONE   */
+/* --			 BUT IS DESIGNED TO BE EXECUTED AS A PART OF SUBROUTINE     */
+/* --			FROM THE MAIN PROC [PROC_SPF_DQC].							*/
+/* ************************************************************************ */
+
+ALTER PROCEDURE [dbo].[PROC_SPF_DQC_CHECKS_UPDATE_STATUS]
+	@ATBL		VARCHAR(25),		/* ATBL:  AUDIT_TBL ID (PASSED IN FROM PROC: [PROC_SPF_DQC_CHECKS] */
+	@DBFLG		VARCHAR(50),		/* DBFLG: DB FLAG (INSERT / UPDATE) */
+	@CHKN		VARCHAR(20),		/* CHKN:  CHECK ID */
+	@STATINT	INT,				/* STATINT: INTEGER VALUE OF CHARACTER STATUS */
+	@STATC		VARCHAR(50),		/* STATC: CHARACTER STATUS */
+	@UPD_ID		VARCHAR(200),		/* UPD_ID: USERID OF THE PERSON INITIATING THE UPDATE */
+	@COMM		VARCHAR(MAX),		/* COMM: COMMENTS */
+	@URI_KEY	VARCHAR(800)		/* URI_KEY: UNIQUE IDENTIFIER KEY */
+AS
+BEGIN
+	-- SET NOCOUNT ON added to prevent extra result sets from
+	-- interfering with SELECT statements.
+	SET NOCOUNT ON;
+
+    DECLARE @UPD_DT DATETIME = GETDATE() /* THIS VALUE WILL BE INSERTED INTO THE STATUS TABLE WHEN DBFLG IS UPDATE */
+	DECLARE @GET_DT VARCHAR(200)
+
+	SET @GET_DT = convert(varchar(10),@UPD_DT, 101) + right(convert(varchar(32),@UPD_DT,100),8)
+
+	/***********************************************************************************************/
+	/* ### BEGIN UPDATE FOR THE STATUS TABLES ###	[BEGIN]									       */
+	/***********************************************************************************************/
+
+	-- AE_001_STATUS | INSERT
+
+	IF (@ATBL = 'AE_001_STATUS')  AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  
+	  BEGIN TRANSACTION
+
+		MERGE [dbo].[AE_001_STATUS] AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI AND
+		   SOURCE.STUDYID = TARGET.STUDYID
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET 
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+
+		COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [AE_001_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+
+
+	END TRY 
+	BEGIN CATCH
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END AE_001_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR AE_001_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'AE_001_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+		BEGIN TRANSACTION
+
+			UPDATE AE_001_STATUS SET 
+							STATUS	= @STATINT,
+							STATUSC	= @STATC,
+							UPDATE_DATE = @GET_DT,
+							UPDATE_ID = @UPD_ID,
+							COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+				WHERE URI = @URI_KEY
+
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END AE_001_STATUS (UPDATE)
+
+
+	IF (@ATBL = 'ALL_002_STATUS')  AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+
+	  BEGIN TRANSACTION
+	  
+		MERGE [dbo].[ALL_002_STATUS] AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+
+		COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [ALL_002_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END ALL_002_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR ALL_002_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'ALL_002_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+	  BEGIN TRANSACTION
+		UPDATE ALL_002_STATUS SET 
+								STATUS	= @STATINT,
+								STATUSC	= @STATC,
+								UPDATE_DATE = @GET_DT,
+								UPDATE_ID = @UPD_ID,
+								COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+				WHERE URI = @URI_KEY
+	  COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END ALL_002_STATUS (UPDATE)
+
+	IF (@ATBL = 'DS_002_STATUS')  AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  
+	  BEGIN TRANSACTION
+
+		MERGE [dbo].[DS_002_STATUS] AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+
+	   COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [DS_002_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY 
+	BEGIN CATCH
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- -- END DS_002_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR DS_002_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'DS_002_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+		BEGIN TRANSACTION
+			UPDATE DS_002_STATUS SET 
+									STATUS	= @STATINT,
+									STATUSC	= @STATC,
+									UPDATE_DATE = @GET_DT,
+									UPDATE_ID = @UPD_ID,
+									COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+					WHERE URI = @URI_KEY
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END DS_002_STATUS (UPDATE)
+
+	IF (@ATBL = 'DS_003_STATUS')   AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  
+	  BEGIN TRANSACTION 
+
+		MERGE [dbo].[DS_003_STATUS] AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+
+	  COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [DS_003_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY 
+	BEGIN CATCH
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END DS_003_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR DS_003_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'DS_003_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+	 BEGIN TRANSACTION
+
+		UPDATE DS_003_STATUS SET 
+								STATUS	= @STATINT,
+								STATUSC	= @STATC,
+								UPDATE_DATE = @GET_DT,
+								UPDATE_ID = @UPD_ID,
+								COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+				WHERE URI = @URI_KEY
+
+	 COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END DS_003_STATUS (UPDATE)
+
+	IF (@ATBL = 'EX_001_STATUS')   AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  
+	  BEGIN TRANSACTION
+
+		MERGE [dbo].[EX_001_STATUS] AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+
+		COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [EX_001_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY 
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END EX_001_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR EX_001_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'EX_001_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+		BEGIN TRANSACTION
+			UPDATE EX_001_STATUS SET 
+									STATUS	= @STATINT,
+									STATUSC	= @STATC,
+									UPDATE_DATE = @GET_DT,
+									UPDATE_ID = @UPD_ID,
+									COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+					WHERE URI = @URI_KEY
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END EX_001_STATUS (UPDATE)
+
+	IF (@ATBL = 'EX_005_STATUS')   AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  BEGIN TRANSACTION
+		MERGE [dbo].[EX_005_STATUS] AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+		COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [EX_005_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY 
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END EX_005_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR EX_001_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'EX_005_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+		BEGIN TRANSACTION
+			UPDATE EX_005_STATUS SET 
+									STATUS	= @STATINT,
+									STATUSC	= @STATC,
+									UPDATE_DATE = @GET_DT,
+									UPDATE_ID = @UPD_ID,
+									COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+					WHERE URI = @URI_KEY
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END EX_005_STATUS (UPDATE)
+
+	/* ****************************************************************************************** */
+	/* -------------------------- BEGIN GEN SERIES DECLARATIONS --------------------------------- */
+	/* ****************************************************************************************** */
+
+	/* *************************** */
+	/* INSERT FOR GEN_001_STATUS   */
+	/* *************************** */
+	IF (@ATBL = 'GEN_001_STATUS')   AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  BEGIN TRANSACTION
+		MERGE [dbo].GEN_001_STATUS AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+		COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [GEN_001_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY 
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END GEN_001_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR GEN_001_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'GEN_001_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+		BEGIN TRANSACTION
+			UPDATE GEN_001_STATUS SET 
+									STATUS	= @STATINT,
+									STATUSC	= @STATC,
+									UPDATE_DATE = @GET_DT,
+									UPDATE_ID = @UPD_ID,
+									COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+					WHERE URI = @URI_KEY
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END GEN_001_STATUS (UPDATE)
+
+	/* *************************** */
+	/* INSERT FOR GEN_002_STATUS   */
+	/* *************************** */
+	IF (@ATBL = 'GEN_002_STATUS')   AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  BEGIN TRANSACTION
+		MERGE [dbo].GEN_002_STATUS AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+		COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [GEN_002_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY 
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END GEN_002_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR GEN_002_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'GEN_002_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+		BEGIN TRANSACTION
+			UPDATE GEN_002_STATUS SET 
+									STATUS	= @STATINT,
+									STATUSC	= @STATC,
+									UPDATE_DATE = @GET_DT,
+									UPDATE_ID = @UPD_ID,
+									COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+					WHERE URI = @URI_KEY
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END GEN_002_STATUS (UPDATE)
+
+	/* *************************** */
+	/* INSERT FOR GEN_003_STATUS   */
+	/* *************************** */
+	IF (@ATBL = 'GEN_003_STATUS')   AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  BEGIN TRANSACTION
+		MERGE [dbo].GEN_003_STATUS AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+		COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [GEN_003_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY 
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END GEN_003_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR GEN_003_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'GEN_003_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+		BEGIN TRANSACTION
+			UPDATE GEN_003_STATUS SET 
+									STATUS	= @STATINT,
+									STATUSC	= @STATC,
+									UPDATE_DATE = @GET_DT,
+									UPDATE_ID = @UPD_ID,
+									COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+					WHERE URI = @URI_KEY
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END GEN_003_STATUS (UPDATE)
+
+	/* ****************************************************************************************** */
+	/* -------------------------- BEGIN GEN SERIES DECLARATIONS --------------------------------- */
+	/* ****************************************************************************************** */
+
+	/* *************************** */
+	/* INSERT FOR LB_001_STATUS   */
+	/* *************************** */
+	IF (@ATBL = 'LB_001_STATUS')   AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  BEGIN TRANSACTION
+		MERGE [dbo].[LB_001_STATUS] AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+		COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [LB_001_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END LB_001_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR LB_001_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'LB_001_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+		BEGIN TRANSACTION
+			UPDATE LB_001_STATUS SET 
+									STATUS	= @STATINT,
+									STATUSC	= @STATC,
+									UPDATE_DATE = @GET_DT,
+									UPDATE_ID = @UPD_ID,
+									COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+					WHERE URI = @URI_KEY
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END LB_001_STATUS (UPDATE)
+
+	IF (@ATBL = 'MH_001_STATUS')   AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  BEGIN TRANSACTION
+		MERGE [dbo].[MH_001_STATUS] AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+		COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [MH_001_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END MH_001_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR MH_001_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'MH_001_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+	  BEGIN TRANSACTION
+		UPDATE MH_001_STATUS SET 
+								STATUS	= @STATINT,
+								STATUSC	= @STATC,
+								UPDATE_DATE = @GET_DT,
+								UPDATE_ID = @UPD_ID,
+								COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+				WHERE URI = @URI_KEY
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END MH_001_STATUS (UPDATE)
+
+	IF (@ATBL = 'RP_001_STATUS')   AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  BEGIN TRANSACTION
+		MERGE [dbo].[RP_001_STATUS] AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+	  COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [RP_001_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY 
+	BEGIN CATCH
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END RP_001_STATUS (INSERT)
+
+	/* ************************ */
+	/* UPDATE FOR RP_001_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'RP_001_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+		BEGIN TRANSACTION
+			UPDATE RP_001_STATUS SET 
+									STATUS	= @STATINT,
+									STATUSC	= @STATC,
+									UPDATE_DATE = @GET_DT,
+									UPDATE_ID = @UPD_ID,
+									COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+					WHERE URI = @URI_KEY
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+			-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END RP_001_STATUS (UPDATE)
+
+	IF (@ATBL = 'VS_001_STATUS')   AND (UPPER(@DBFLG) = 'INSERT')
+	BEGIN TRY
+	  BEGIN TRANSACTION
+		MERGE [dbo].[VS_001_STATUS] AS TARGET
+		USING [dbo].[STAGING_TBL] AS SOURCE 
+		ON SOURCE.URI = TARGET.URI
+
+		--DO THE UPDATE (WHEN MATCHED) AND COMMENTS IS NULL
+		WHEN MATCHED AND TARGET.URI = @URI_KEY THEN UPDATE SET
+			TARGET.STATUS = SOURCE.STATUS,
+			TARGET.STATUSC = SOURCE.STATUSC,
+			TARGET.CREATION_DATE = SOURCE.CREATION_DATE,
+			TARGET.CREATION_ID = SOURCE.CREATION_ID,
+			TARGET.UPDATE_DATE = @GET_DT,
+			TARGET.UPDATE_ID = SOURCE.UPDATE_ID,
+			TARGET.COMMENTS = SOURCE.COMMENTS;
+		COMMIT TRANSACTION
+
+		SELECT @@ROWCOUNT;
+
+			PRINT '**** TARGET TABLE [VS_001_STATUS] IS UPDATED SUCCESSFULLY WITH NEW COMMENT *****'
+			RETURN (0)
+	END TRY 
+	BEGIN CATCH
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+		PRINT 'ERROR [DB_FLG: INSERT]: An unexpected error occured when tying to INSERT COMMENT record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END VS_001_STATUS
+
+	/* ************************ */
+	/* UPDATE FOR VS_001_STATUS */
+	/* ************************ */
+	IF (@ATBL = 'VS_001_STATUS')  AND (UPPER(@DBFLG) = 'UPDATE')
+	BEGIN TRY
+		PRINT ' --- BEGIN UPDATE OF STATUS TABLE: ' + @ATBL
+
+	  BEGIN TRANSACTION
+		UPDATE VS_001_STATUS SET 
+								STATUS	= @STATINT,
+								STATUSC	= @STATC,
+								UPDATE_DATE = @GET_DT,
+								UPDATE_ID = @UPD_ID,
+								COMMENTS = CONCAT(' Update comments on: [',@GET_DT,'] by (',UPDATE_ID,') - ',@COMM,' | (Previous Comments [',UPDATE_DATE,'] by (',UPDATE_ID,'): ',COMMENTS)
+				WHERE URI = @URI_KEY
+		COMMIT TRANSACTION
+
+			RETURN (0)
+
+	END TRY
+	BEGIN CATCH 
+
+		-- Transaction uncommittable
+			IF (XACT_STATE()) = -1
+			  ROLLBACK TRANSACTION
+ 
+		-- Transaction committable
+			IF (XACT_STATE()) = 1
+			  COMMIT TRANSACTION
+
+	   INSERT INTO [dbo].[DB_ERRORS]
+		VALUES
+				(  SUSER_SNAME(),
+				   ERROR_NUMBER(),
+				   ERROR_STATE(),
+				   ERROR_SEVERITY(),
+				   ERROR_LINE(),
+				   ERROR_PROCEDURE(),
+				   ERROR_MESSAGE(),
+				   GETDATE()
+				);	
+
+				RETURN (1)
+
+		PRINT 'ERROR: An unexpected error occured when tying to update record for URI KEY [' + @URI_KEY +'] for status table ' + @ATBL
+		PRINT ' --- UPDATE UNSUCCESSFUL FOR TABLE: ' + @ATBL
+		PRINT ' '
+
+	END CATCH -- END VS_001_STATUS (UPDATE)
+
+		PRINT @ATBL + ' has been updated accordingly !!'
+
+END
